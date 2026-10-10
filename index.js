@@ -82,7 +82,14 @@ app.post('/send-whatsapp', async (req, res) => {
 
     if (mediaBase64 && mediaMimeType) {
       const media = new MessageMedia(mediaMimeType, mediaBase64, mediaFileName || 'attachment');
-      await client.sendMessage(numberId._serialized, media, { caption: message });
+      // The `caption` option on a media send currently throws "Data
+      // passed to getter must include an id property" from inside
+      // WhatsApp Web's own JS — a known wwebjs/WhatsApp-Web
+      // compatibility issue with captioned media. Sending the document
+      // and the text as two separate messages avoids that code path
+      // entirely while still delivering both.
+      await client.sendMessage(numberId._serialized, media);
+      if (message) await client.sendMessage(numberId._serialized, message);
       console.log('📨 WhatsApp document sent to', phone);
     } else {
       await client.sendMessage(numberId._serialized, message);
