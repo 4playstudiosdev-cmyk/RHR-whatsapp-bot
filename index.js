@@ -1,9 +1,11 @@
 const express = require('express');
 const qrcodeTerminal = require('qrcode-terminal');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 
 const app = express();
-app.use(express.json());
+// Default express.json() limit is 100kb — too small for a base64-encoded
+// PDF/image attachment (see /send-whatsapp's optional mediaBase64).
+app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 3001;
 
@@ -57,10 +59,12 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', whatsappReady: isReady });
 });
 
-// POST /send-whatsapp — { phone, message }
+// POST /send-whatsapp — { phone, message } for plain text, or add
+// { mediaBase64, mediaMimeType, mediaFileName } to send a document/image
+// attachment instead (message becomes the caption).
 app.post('/send-whatsapp', async (req, res) => {
   try {
-    const { phone, message } = req.body;
+    const { phone, message, mediaBase64, mediaMimeType, mediaFileName } = req.body;
     if (!phone || !message) {
       return res.status(400).json({ success: false, message: 'phone and message are required' });
     }
@@ -76,8 +80,14 @@ app.post('/send-whatsapp', async (req, res) => {
       return res.status(404).json({ success: false, message: `${phone} is not registered on WhatsApp` });
     }
 
-    await client.sendMessage(numberId._serialized, message);
-    console.log('📨 WhatsApp message sent to', phone);
+    if (mediaBase64 && mediaMimeType) {
+      const media = new MessageMedia(mediaMimeType, mediaBase64, mediaFileName || 'attachment');
+      await client.sendMessage(numberId._serialized, media, { caption: message });
+      console.log('📨 WhatsApp document sent to', phone);
+    } else {
+      await client.sendMessage(numberId._serialized, message);
+      console.log('📨 WhatsApp message sent to', phone);
+    }
     return res.json({ success: true, message: 'Message sent' });
   } catch (err) {
     console.error('Send WhatsApp error:', err.message);
