@@ -22,12 +22,18 @@ const app = express();
 app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 3001;
-// Reuses the existing Railway volume mount (RAILWAY_VOLUME_MOUNT_PATH=
-// /app/wwebjs_auth) so the persistent session survives restarts without
-// any Railway volume reconfiguration — the directory name is a leftover
-// from whatsapp-web.js, but Baileys writes its own file format into it
-// just the same.
-const AUTH_DIR = './wwebjs_auth';
+// A subdirectory of the existing Railway volume mount
+// (RAILWAY_VOLUME_MOUNT_PATH=/app/wwebjs_auth) — still on the
+// persistent volume, so the session survives restarts, but a path
+// whatsapp-web.js never wrote into. Re-pointing Baileys straight at
+// ./wwebjs_auth produced a flood of Signal "Bad MAC" decrypt errors
+// and silently-undelivered sends — the directory clear that was
+// supposed to wipe whatsapp-web.js's old Chromium profile data before
+// Baileys got there failed with EBUSY both times it was tried, so
+// Baileys' creds likely got written alongside (and corrupted by)
+// leftover state from the old library. A clean, never-touched
+// subdirectory sidesteps that instead of fighting the EBUSY further.
+const AUTH_DIR = './wwebjs_auth/baileys_session';
 
 // One-time escape hatch for a stuck/corrupted session — set
 // CLEAR_WHATSAPP_SESSION=true in Railway variables, redeploy once, then
