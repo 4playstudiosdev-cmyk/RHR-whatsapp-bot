@@ -50,6 +50,7 @@ if (process.env.CLEAR_WHATSAPP_SESSION === 'true') {
 
 let sock;
 let isReady = false;
+let pairingRequested = false;
 
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -59,14 +60,37 @@ async function startSock() {
     version,
     auth: state,
     logger: pino({ level: 'silent' }),
+    // A QR image only stays valid for ~20-30s — by the time it's
+    // fetched from these logs, turned into a scannable image, and
+    // actually displayed, that window was consistently already gone
+    // (confirmed via "disconnected: 408" = QR timeout in these logs).
+    // A pairing code lasts much longer and is typed in by hand instead
+    // of needing a live camera scan against a fast-expiring image, so
+    // it isn't racing the same clock. Set PAIR_PHONE_NUMBER (digits
+    // only, country code first, e.g. 923001234567) in Railway
+    // variables to use it instead of the QR.
+    printQRInTerminal: false,
   });
 
   sock.ev.on('creds.update', saveCreds);
 
+  if (process.env.PAIR_PHONE_NUMBER && !sock.authState.creds.registered && !pairingRequested) {
+    pairingRequested = true;
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(process.env.PAIR_PHONE_NUMBER);
+        console.log('🔑 Pairing code (enter in WhatsApp > Linked Devices > Link with phone number instead):');
+        console.log('PAIRING_CODE:' + code);
+      } catch (err) {
+        console.error('Failed to request pairing code:', err.message);
+      }
+    }, 3000); // socket needs a moment to finish connecting before this call works
+  }
+
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
+    if (qr && !process.env.PAIR_PHONE_NUMBER) {
       console.log('📱 Scan this QR code with WhatsApp (Linked Devices):');
       qrcodeTerminal.generate(qr, { small: true });
       console.log('RAW_QR:' + qr);
