@@ -1,3 +1,4 @@
+const fs = require('fs');
 const express = require('express');
 const qrcodeTerminal = require('qrcode-terminal');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
@@ -8,6 +9,21 @@ const app = express();
 app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 3001;
+
+// One-time escape hatch for a session stuck past 'authenticated' and
+// never reaching 'ready' (seen after several rapid restarts in a row —
+// no error, just silently hung, and a plain restart alone didn't clear
+// it). Set CLEAR_WHATSAPP_SESSION=true in Railway variables, redeploy
+// once, then unset it — the next boot wipes the saved session and
+// shows a fresh QR code in these logs to re-link the phone.
+if (process.env.CLEAR_WHATSAPP_SESSION === 'true') {
+  try {
+    fs.rmSync('./wwebjs_auth', { recursive: true, force: true });
+    console.log('🧹 Cleared ./wwebjs_auth — will show a fresh QR code to re-link.');
+  } catch (e) {
+    console.error('Failed to clear session:', e.message);
+  }
+}
 
 let isReady = false;
 
