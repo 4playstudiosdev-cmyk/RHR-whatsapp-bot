@@ -1,74 +1,92 @@
 const fs = require('fs');
 const express = require('express');
 const qrcodeTerminal = require('qrcode-terminal');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const pino = require('pino');
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
 
+// Replaces whatsapp-web.js (which drives a real headless Chromium tab
+// simulating WhatsApp Web in the browser) — that media-send path
+// reliably crashed with a minified internal error ("r") in this
+// environment, for every attachment (image or PDF alike), while plain
+// text always worked fine. Baileys talks to WhatsApp's own multi-device
+// protocol directly over a WebSocket, no browser involved, so that
+// whole class of browser-side crash doesn't exist here.
 const app = express();
 // Default express.json() limit is 100kb — too small for a base64-encoded
 // PDF/image attachment (see /send-whatsapp's optional mediaBase64).
 app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 3001;
+// Reuses the existing Railway volume mount (RAILWAY_VOLUME_MOUNT_PATH=
+// /app/wwebjs_auth) so the persistent session survives restarts without
+// any Railway volume reconfiguration — the directory name is a leftover
+// from whatsapp-web.js, but Baileys writes its own file format into it
+// just the same.
+const AUTH_DIR = './wwebjs_auth';
 
-// One-time escape hatch for a session stuck past 'authenticated' and
-// never reaching 'ready' (seen after several rapid restarts in a row —
-// no error, just silently hung, and a plain restart alone didn't clear
-// it). Set CLEAR_WHATSAPP_SESSION=true in Railway variables, redeploy
-// once, then unset it — the next boot wipes the saved session and
-// shows a fresh QR code in these logs to re-link the phone.
+// One-time escape hatch for a stuck/corrupted session — set
+// CLEAR_WHATSAPP_SESSION=true in Railway variables, redeploy once, then
+// unset it. The next boot wipes the saved session and shows a fresh QR
+// code in these logs to re-link the phone.
 if (process.env.CLEAR_WHATSAPP_SESSION === 'true') {
   try {
-    fs.rmSync('./wwebjs_auth', { recursive: true, force: true });
-    console.log('🧹 Cleared ./wwebjs_auth — will show a fresh QR code to re-link.');
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    console.log('🧹 Cleared saved session — will show a fresh QR code to re-link.');
   } catch (e) {
     console.error('Failed to clear session:', e.message);
   }
 }
 
+let sock;
 let isReady = false;
 
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: './wwebjs_auth' }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu',
-    ],
-  },
-});
+async function startSock() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
 
-client.on('qr', (qr) => {
-  console.log('📱 Scan this QR code with WhatsApp (Linked Devices):');
-  qrcodeTerminal.generate(qr, { small: true });
-  console.log('RAW_QR:' + qr);
-});
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+  });
 
-client.on('ready', () => {
-  isReady = true;
-  console.log('✅ WhatsApp bot is ready to send messages!');
-});
+  sock.ev.on('creds.update', saveCreds);
 
-client.on('authenticated', () => {
-  console.log('🔐 WhatsApp authenticated — session saved to ./wwebjs_auth');
-});
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-client.on('auth_failure', (msg) => {
-  console.error('❌ WhatsApp auth failed:', msg);
-});
+    if (qr) {
+      console.log('📱 Scan this QR code with WhatsApp (Linked Devices):');
+      qrcodeTerminal.generate(qr, { small: true });
+      console.log('RAW_QR:' + qr);
+    }
 
-client.on('disconnected', (reason) => {
-  isReady = false;
-  console.log('⚠️ WhatsApp disconnected:', reason);
-});
+    if (connection === 'open') {
+      isReady = true;
+      console.log('✅ WhatsApp bot is ready to send messages!');
+    }
 
-client.initialize();
+    if (connection === 'close') {
+      isReady = false;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      console.log('⚠️ WhatsApp disconnected:', statusCode, loggedOut ? '(logged out — needs a fresh QR scan)' : '(reconnecting)');
+      // Baileys' socket closes on every transient network blip, not just
+      // a real logout — reconnect automatically unless the user actually
+      // unlinked the device from their phone.
+      if (!loggedOut) {
+        startSock();
+      }
+    }
+  });
+}
+
+startSock().catch((err) => console.error('Failed to start WhatsApp socket:', err.message));
 
 // GET /health
 app.get('/health', (req, res) => {
@@ -91,34 +109,22 @@ app.post('/send-whatsapp', async (req, res) => {
     let formatted = phone.replace(/\D/g, '');
     if (formatted.startsWith('0')) formatted = '92' + formatted.slice(1);
 
-    const numberId = await client.getNumberId(formatted);
-    if (!numberId) {
+    const [result] = await sock.onWhatsApp(formatted);
+    if (!result?.exists) {
       return res.status(404).json({ success: false, message: `${phone} is not registered on WhatsApp` });
     }
+    const jid = result.jid;
 
     if (mediaBase64 && mediaMimeType) {
-      const media = new MessageMedia(mediaMimeType, mediaBase64, mediaFileName || 'attachment');
-      // client.sendMessage(id, media) throws "Data passed to getter must
-      // include an id property" from inside WhatsApp Web's own JS for
-      // media sends specifically — a known wwebjs/WhatsApp-Web
-      // compatibility issue. Routing through the already-resolved Chat
-      // object's own sendMessage avoids that internal lookup.
-      const chat = await client.getChatById(numberId._serialized);
-      // No options object here — adding { sendMediaAsDocument: true }
-      // (an earlier attempt at fixing image sends) broke even plain PDF
-      // sends, which had worked fine with the bare single-argument call
-      // below for money receipts all along. The root problem (an image
-      // mimetype crashing WhatsApp Web's internal preview/thumbnail step
-      // with a minified "r" error) is instead avoided upstream now — the
-      // backend converts an uploaded image into a one-page PDF before it
-      // ever reaches this endpoint (see RHR-backend's
-      // broadcast.controller.js), so mediaMimeType here is always
-      // 'application/pdf' and this plain call is enough.
-      await chat.sendMessage(media);
-      if (message) await chat.sendMessage(message);
-      console.log('📨 WhatsApp document sent to', phone);
+      const buffer = Buffer.from(mediaBase64, 'base64');
+      const isImage = mediaMimeType.startsWith('image/');
+      const content = isImage
+        ? { image: buffer, mimetype: mediaMimeType, caption: message || '' }
+        : { document: buffer, mimetype: mediaMimeType, fileName: mediaFileName || 'attachment', caption: message || '' };
+      await sock.sendMessage(jid, content);
+      console.log('📨 WhatsApp attachment sent to', phone);
     } else {
-      await client.sendMessage(numberId._serialized, message);
+      await sock.sendMessage(jid, { text: message });
       console.log('📨 WhatsApp message sent to', phone);
     }
     return res.json({ success: true, message: 'Message sent' });
