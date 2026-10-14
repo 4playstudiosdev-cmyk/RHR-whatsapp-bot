@@ -88,7 +88,15 @@ app.post('/send-whatsapp', async (req, res) => {
       // compatibility issue. Routing through the already-resolved Chat
       // object's own sendMessage avoids that internal lookup.
       const chat = await client.getChatById(numberId._serialized);
-      await chat.sendMessage(media);
+      // sendMediaAsDocument skips WhatsApp Web's inline image-preview/
+      // thumbnail generation — that step throws a minified internal error
+      // ("r") under this headless Chromium's canvas flags (--disable-gpu,
+      // --disable-accelerated-2d-canvas) specifically for image mimetypes;
+      // PDFs never hit that code path, which is why document sends (money
+      // receipts) always worked while image sends (broadcast attachments)
+      // didn't. Sent as a document instead — still delivers the file, just
+      // without the inline photo preview.
+      await chat.sendMessage(media, { sendMediaAsDocument: true });
       if (message) await chat.sendMessage(message);
       console.log('📨 WhatsApp document sent to', phone);
     } else {
